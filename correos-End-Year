@@ -1,0 +1,974 @@
+
+Option Explicit
+
+'=========================================================
+' CONFIGURACIÓN
+'=========================================================
+
+Private Const SHEET_OVERDUE As String = "vencido"
+Private Const SHEET_UPCOMING As String = "Por vencer"
+
+Private Const HEADER_ROW As Long = 3
+Private Const FIRST_DATA_ROW As Long = 4
+
+Private Const COL_EXECUTIVE As Long = 3
+Private Const COL_CUSTOMER As Long = 4
+Private Const COL_DOCUMENT As Long = 5
+Private Const COL_BL As Long = 8
+Private Const COL_POD As Long = 9
+Private Const COL_ETA As Long = 10
+Private Const COL_DUE_DATE As Long = 11
+Private Const COL_BALANCE As Long = 15
+Private Const COL_PAYMENT_DESCRIPTION As Long = 19
+
+Private Const COL_PROCESS_STATUS As Long = 21  ' U
+Private Const COL_EMAIL_TO As Long = 22        ' V
+Private Const COL_CC As Long = 23              ' W
+Private Const COL_CC2 As Long = 24             ' X
+
+Private Const FONT_NAME As String = "Aptos"
+
+'=========================================================
+' MACRO PRINCIPAL
+'=========================================================
+
+Public Sub GenerarCorreosCobranza()
+
+    Dim wb As Workbook
+    Dim wsOverdue As Worksheet
+    Dim wsUpcoming As Worksheet
+
+    Dim customers As Object
+    Dim customerData As Object
+
+    Dim olApp As Object
+    Dim customerKey As Variant
+    Dim customerName As String
+    Dim result As String
+
+    Dim i As Long
+    Dim lastRow As Long
+    Dim rowNumber As Long
+
+    Dim processed As Long
+    Dim successful As Long
+    Dim errorsCount As Long
+
+    On Error GoTo GeneralError
+
+    Set wb = ThisWorkbook
+
+    Set wsOverdue = wb.Worksheets(SHEET_OVERDUE)
+    Set wsUpcoming = wb.Worksheets(SHEET_UPCOMING)
+
+    Set customers = CreateObject("Scripting.Dictionary")
+    customers.CompareMode = vbTextCompare
+
+    '-----------------------------------------------------
+    ' Recopilar información de ambas hojas
+    '-----------------------------------------------------
+
+    CollectSheetData wsOverdue, customers, True
+    CollectSheetData wsUpcoming, customers, False
+
+    If customers.Count = 0 Then
+        MsgBox "No se encontraron clientes para procesar.", vbInformation
+        Exit Sub
+    End If
+
+    '-----------------------------------------------------
+    ' Conectar con Outlook Classic
+    '-----------------------------------------------------
+
+    On Error Resume Next
+    Set olApp = GetObject(, "Outlook.Application")
+
+    If olApp Is Nothing Then
+        Set olApp = CreateObject("Outlook.Application")
+    End If
+    On Error GoTo GeneralError
+
+    If olApp Is Nothing Then
+        MsgBox "No fue posible iniciar Outlook Classic.", vbExclamation
+        Exit Sub
+    End If
+
+    '-----------------------------------------------------
+    ' Procesar un correo por cliente
+    '-----------------------------------------------------
+
+    For Each customerKey In customers.Keys
+
+        Set customerData = customers(customerKey)
+
+        customerName = CStr(customerData("Customer"))
+
+        result = CreateCustomerDraft( _
+                    olApp, _
+                    customerData, _
+                    customerName)
+
+        ' Registrar resultado en U para todas las filas
+        ' del cliente, tanto en vencido como en Por vencer.
+
+        UpdateCustomerStatus customerData, result, _
+                             wsOverdue, wsUpcoming
+
+        processed = processed + 1
+
+        If result = "OK" Then
+            successful = successful + 1
+        Else
+            errorsCount = errorsCount + 1
+        End If
+
+    Next customerKey
+
+    MsgBox "Proceso finalizado." & vbCrLf & vbCrLf & _
+           "Clientes procesados: " & processed & vbCrLf & _
+           "Correos preparados: " & successful & vbCrLf & _
+           "Pendientes o errores: " & errorsCount & vbCrLf & vbCrLf & _
+           "Los correos se han abierto como borradores. " & _
+           "No se ha enviado ninguno.", vbInformation
+
+    Exit Sub
+
+GeneralError:
+
+    MsgBox "Se produjo un error durante el proceso:" & vbCrLf & _
+           Err.Description, vbCritical
+
+End Sub
+
+'=========================================================
+' RECOPILAR INFORMACIÓN DE CADA HOJA
+'=========================================================
+
+Private Sub CollectSheetData( _
+    ByVal ws As Worksheet, _
+    ByVal customers As Object, _
+    ByVal isOverdue As Boolean)
+
+    Dim lastRow As Long
+    Dim r As Long
+
+    Dim customerName As String
+    Dim customerKey As String
+
+    Dim customerData As Object
+    Dim rowReferences As Collection
+    Dim documentRows As Collection
+
+    Dim rowReference As Variant
+    Dim rowData As Variant
+
+    lastRow = ws.Cells(ws.Rows.Count, COL_CUSTOMER).End(xlUp).Row
+
+    For r = FIRST_DATA_ROW To lastRow
+
+        customerName = Trim$(CStr(ws.Cells(r, COL_CUSTOMER).Value))
+
+        If customerName <> vbNullString Then
+
+            customerKey = UCase$(customerName)
+
+            If Not customers.Exists(customerKey) Then
+
+                Set customerData = CreateObject("Scripting.Dictionary")
+                customerData.CompareMode = vbTextCompare
+
+                customerData.Add "Customer", customerName
+
+                Set rowReferences = New Collection
+                Set documentRows = New Collection
+
+                customerData.Add "AllRows", rowReferences
+                customerData.Add "OverdueRows", New Collection
+                customerData.Add "UpcomingRows", New Collection
+
+                customers.Add customerKey, customerData
+
+            Else
+
+                Set customerData = customers(customerKey)
+
+            End If
+
+            ' Referencia para registrar el estado en U
+            rowReference = Array(ws.Name, r)
+            customerData("AllRows").Add rowReference
+
+            ' Solo incorporar documentos con número de documento
+            If Trim$(CStr(ws.Cells(r, COL_DOCUMENT).Value)) <> vbNullString Then
+
+                rowData = Array( _
+                    ws.Name, _
+                    r, _
+                    customerName, _
+                    ws.Cells(r, COL_DOCUMENT).Value, _
+                    ws.Cells(r, COL_BL).Value, _
+                    ws.Cells(r, COL_POD).Value, _
+                    ws.Cells(r, COL_ETA).Value, _
+                    ws.Cells(r, COL_DUE_DATE).Value, _
+                    ws.Cells(r, COL_BALANCE).Value, _
+                    ws.Cells(r, COL_PAYMENT_DESCRIPTION).Value)
+
+                If isOverdue Then
+                    customerData("OverdueRows").Add rowData
+                Else
+                    customerData("UpcomingRows").Add rowData
+                End If
+
+            End If
+
+        End If
+
+    Next r
+
+End Sub
+
+'=========================================================
+' CREAR BORRADOR DEL CLIENTE
+'=========================================================
+
+Private Function CreateCustomerDraft( _
+    ByVal olApp As Object, _
+    ByVal customerData As Object, _
+    ByVal customerName As String) As String
+
+    Dim toRecipients As Object
+    Dim ccRecipients As Object
+
+    Dim allRows As Collection
+    Dim overdueRows As Collection
+    Dim upcomingRows As Collection
+
+    Dim mail As Object
+
+    Dim htmlBody As String
+    Dim signatureHTML As String
+
+    Dim subjectText As String
+    Dim toText As String
+    Dim ccText As String
+
+    Dim invalidEmail As Boolean
+    Dim hasOverdue As Boolean
+    Dim hasUpcoming As Boolean
+
+    Dim rowReference As Variant
+    Dim ws As Worksheet
+    Dim r As Long
+
+    On Error GoTo DraftError
+
+    Set allRows = customerData("AllRows")
+    Set overdueRows = customerData("OverdueRows")
+    Set upcomingRows = customerData("UpcomingRows")
+
+    hasOverdue = overdueRows.Count > 0
+    hasUpcoming = upcomingRows.Count > 0
+
+    If Not hasOverdue And Not hasUpcoming Then
+        CreateCustomerDraft = "CUSTOMER WITHOUT DOCUMENTS"
+        Exit Function
+    End If
+
+    Set toRecipients = CreateObject("Scripting.Dictionary")
+    toRecipients.CompareMode = vbTextCompare
+
+    Set ccRecipients = CreateObject("Scripting.Dictionary")
+    ccRecipients.CompareMode = vbTextCompare
+
+    '-----------------------------------------------------
+    ' Obtener TO, CC y CC2 de todas las filas del cliente
+    '-----------------------------------------------------
+
+    For Each rowReference In allRows
+
+        Set ws = ThisWorkbook.Worksheets(CStr(rowReference(0)))
+        r = CLng(rowReference(1))
+
+        ' V = TO. Puede contener CC: dentro del texto.
+        AddRecipientsFromToCell _
+            CStr(ws.Cells(r, COL_EMAIL_TO).Value), _
+            toRecipients, ccRecipients, invalidEmail
+
+        ' W = CC
+        AddEmailsFromText _
+            CStr(ws.Cells(r, COL_CC).Value), _
+            ccRecipients, invalidEmail
+
+        ' X = CC2
+        AddEmailsFromText _
+            CStr(ws.Cells(r, COL_CC2).Value), _
+            ccRecipients, invalidEmail
+
+    Next rowReference
+
+    If toRecipients.Count = 0 Then
+        CreateCustomerDraft = "NO EMAIL"
+        Exit Function
+    End If
+
+    If invalidEmail Then
+        CreateCustomerDraft = "INVALID EMAIL"
+        Exit Function
+    End If
+
+    ' Evitar que una dirección aparezca en TO y CC
+    RemoveDuplicateToFromCC toRecipients, ccRecipients
+
+    toText = DictionaryToString(toRecipients)
+    ccText = DictionaryToString(ccRecipients)
+
+    '-----------------------------------------------------
+    ' Asunto
+    '-----------------------------------------------------
+
+    If hasOverdue And hasUpcoming Then
+
+        subjectText = "Year-End Closing - Account Statement - " & customerName
+
+    ElseIf hasOverdue Then
+
+        subjectText = "Year-End Closing - Overdue Invoices - " & customerName
+
+    Else
+
+        subjectText = "Year-End Closing - Upcoming Invoices - " & customerName
+
+    End If
+
+    '-----------------------------------------------------
+    ' Construir cuerpo HTML
+    '-----------------------------------------------------
+
+    htmlBody = BuildEmailHTML( _
+                    customerName, _
+                    overdueRows, _
+                    upcomingRows, _
+                    hasOverdue, _
+                    hasUpcoming)
+
+    '-----------------------------------------------------
+    ' Crear borrador y conservar firma de Outlook
+    '-----------------------------------------------------
+
+    Set mail = olApp.CreateItem(0)
+
+    With mail
+
+        .To = toText
+        .CC = ccText
+        .Subject = subjectText
+
+        ' Mostrar primero para que Outlook inserte su firma
+        .Display
+
+        signatureHTML = .HTMLBody
+
+        ' Agregar el correo antes de la firma
+        .HTMLBody = htmlBody & signatureHTML
+
+    End With
+
+    CreateCustomerDraft = "OK"
+
+    Exit Function
+
+DraftError:
+
+    CreateCustomerDraft = "OUTLOOK ERROR: " & Err.Description
+
+End Function
+
+'=========================================================
+' PROCESAR TO Y CC: DENTRO DE LA COLUMNA V
+'=========================================================
+
+Private Sub AddRecipientsFromToCell( _
+    ByVal rawText As String, _
+    ByVal toRecipients As Object, _
+    ByVal ccRecipients As Object, _
+    ByRef invalidEmail As Boolean)
+
+    Dim positionCC As Long
+    Dim toPart As String
+    Dim ccPart As String
+
+    rawText = Trim$(rawText)
+
+    If rawText = vbNullString Then Exit Sub
+
+    positionCC = InStr(1, rawText, "CC:", vbTextCompare)
+
+    If positionCC > 0 Then
+
+        toPart = Left$(rawText, positionCC - 1)
+        ccPart = Mid$(rawText, positionCC + 3)
+
+        AddEmailsFromText toPart, toRecipients, invalidEmail
+        AddEmailsFromText ccPart, ccRecipients, invalidEmail
+
+    Else
+
+        AddEmailsFromText rawText, toRecipients, invalidEmail
+
+    End If
+
+End Sub
+
+'=========================================================
+' EXTRAER DIRECCIONES DE CORREO
+'=========================================================
+
+Private Sub AddEmailsFromText( _
+    ByVal rawText As String, _
+    ByVal targetDictionary As Object, _
+    ByRef invalidEmail As Boolean)
+
+    Dim regex As Object
+    Dim matches As Object
+    Dim match As Object
+
+    Dim emailAddress As String
+
+    rawText = Trim$(rawText)
+
+    If rawText = vbNullString Then Exit Sub
+
+    Set regex = CreateObject("VBScript.RegExp")
+
+    With regex
+        .Global = True
+        .IgnoreCase = True
+        .Pattern = "[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"
+    End With
+
+    Set matches = regex.Execute(rawText)
+
+    If matches.Count = 0 Then
+        invalidEmail = True
+        Exit Sub
+    End If
+
+    For Each match In matches
+
+        emailAddress = LCase$(Trim$(match.Value))
+
+        If Not targetDictionary.Exists(emailAddress) Then
+            targetDictionary.Add emailAddress, emailAddress
+        End If
+
+    Next match
+
+End Sub
+
+'=========================================================
+' QUITAR DIRECCIONES REPETIDAS ENTRE TO Y CC
+'=========================================================
+
+Private Sub RemoveDuplicateToFromCC( _
+    ByVal toRecipients As Object, _
+    ByVal ccRecipients As Object)
+
+    Dim key As Variant
+
+    For Each key In toRecipients.Keys
+
+        If ccRecipients.Exists(CStr(key)) Then
+            ccRecipients.Remove CStr(key)
+        End If
+
+    Next key
+
+End Sub
+
+'=========================================================
+' CONVERTIR DICCIONARIO A TEXTO SEPARADO POR ;
+'=========================================================
+
+Private Function DictionaryToString(ByVal dictionary As Object) As String
+
+    Dim key As Variant
+    Dim result As String
+
+    result = vbNullString
+
+    For Each key In dictionary.Keys
+
+        If result <> vbNullString Then
+            result = result & "; "
+        End If
+
+        result = result & CStr(dictionary(key))
+
+    Next key
+
+    DictionaryToString = result
+
+End Function
+
+'=========================================================
+' CONSTRUIR CUERPO DEL CORREO
+'=========================================================
+
+Private Function BuildEmailHTML( _
+    ByVal customerName As String, _
+    ByVal overdueRows As Collection, _
+    ByVal upcomingRows As Collection, _
+    ByVal hasOverdue As Boolean, _
+    ByVal hasUpcoming As Boolean) As String
+
+    Dim html As String
+
+    html = vbNullString
+
+    html = html & "<html><body style='" & _
+                  "font-family:Aptos,Calibri,sans-serif;" & _
+                  "font-size:11pt;" & _
+                  "color:#222222;" & _
+                  "line-height:1.15;'>"
+
+    ' Saludo
+    html = html & "<p style='font-size:11pt;margin:0 0 10pt 0;'>" & _
+                  "Dear " & HtmlEncode(customerName) & " Team," & _
+                  "</p>"
+
+    '-----------------------------------------------------
+    ' FACTURAS VENCIDAS
+    '-----------------------------------------------------
+
+    If hasOverdue Then
+
+        html = html & "<p style='font-size:12pt;font-weight:bold;" & _
+                      "margin:0 0 8pt 0;'>" & _
+                      "Overdue Invoices – Year-End Closing" & _
+                      "</p>"
+
+        html = html & "<p style='font-size:11pt;margin:0 0 10pt 0;'>" & _
+                      "As part of our year-end closing process, our records " & _
+                      "indicate that the following invoices remain outstanding. " & _
+                      "We would appreciate your support in confirming their " & _
+                      "expected payment dates." & _
+                      "</p>"
+
+        html = html & BuildTableHTML(overdueRows, True)
+
+    End If
+
+    '-----------------------------------------------------
+    ' FACTURAS POR VENCER
+    '-----------------------------------------------------
+
+    If hasUpcoming Then
+
+        If hasOverdue Then
+
+            html = html & "<p style='font-size:11pt;margin:10pt 0;'>" & _
+                          "In addition to the overdue invoices listed above, " & _
+                          "please find below the invoices approaching their " & _
+                          "due dates. We would also appreciate it if you could " & _
+                          "confirm their expected payment dates." & _
+                          "</p>"
+
+        Else
+
+            html = html & "<p style='font-size:11pt;margin:0 0 10pt 0;'>" & _
+                          "As part of our year-end closing process, we would " & _
+                          "appreciate your support in reviewing the upcoming " & _
+                          "invoices listed below and confirming their expected " & _
+                          "payment dates." & _
+                          "</p>"
+
+        End If
+
+        html = html & "<p style='font-size:12pt;font-weight:bold;" & _
+                      "margin:0 0 8pt 0;'>" & _
+                      "Upcoming Invoices – Year-End Closing" & _
+                      "</p>"
+
+        html = html & BuildTableHTML(upcomingRows, False)
+
+    End If
+
+    '-----------------------------------------------------
+    ' CIERRE
+    '-----------------------------------------------------
+
+    html = html & "<p style='font-size:11pt;margin:12pt 0 10pt 0;'>" & _
+                  "Should you require any supporting documentation or have " & _
+                  "any questions regarding the statement, please do not " & _
+                  "hesitate to contact us." & _
+                  "</p>"
+
+    html = html & "<p style='font-size:11pt;margin:0 0 10pt 0;'>" & _
+                  "Thank you in advance for your cooperation." & _
+                  "</p>"
+
+    html = html & "</body></html>"
+
+    BuildEmailHTML = html
+
+End Function
+
+'=========================================================
+' CONSTRUIR TABLA HTML
+'=========================================================
+
+Private Function BuildTableHTML( _
+    ByVal sourceRows As Collection, _
+    ByVal isOverdue As Boolean) As String
+
+    Dim html As String
+    Dim sortedRows As Variant
+    Dim rowData As Variant
+
+    Dim i As Long
+    Dim headerColor As String
+    Dim totalBalance As Double
+
+    sortedRows = SortRowsByDueDate(sourceRows)
+
+    If isOverdue Then
+        headerColor = GetHeaderColor(SHEET_OVERDUE, RGB(192, 0, 0))
+    Else
+        headerColor = GetHeaderColor(SHEET_UPCOMING, RGB(0, 128, 0))
+    End If
+
+    html = "<table style='" & _
+           "border-collapse:collapse;" & _
+           "border-spacing:0;" & _
+           "margin:0;" & _
+           "padding:0;" & _
+           "width:760px;" & _
+           "table-layout:fixed;" & _
+           "font-family:Aptos,Calibri,sans-serif;" & _
+           "font-size:9pt;'>"
+
+    '-----------------------------------------------------
+    ' Encabezados
+    '-----------------------------------------------------
+
+    html = html & "<tr style='background-color:" & headerColor & _
+                  ";color:#FFFFFF;font-weight:bold;text-align:center;'>"
+
+    html = html & TableHeaderCell("CUSTOMER", 100)
+    html = html & TableHeaderCell("DOCUMENT", 115)
+    html = html & TableHeaderCell("BL", 65)
+    html = html & TableHeaderCell("POD", 65)
+    html = html & TableHeaderCell("ETA", 65)
+    html = html & TableHeaderCell("DUE DATE", 80)
+    html = html & TableHeaderCell("BALANCE DUE", 105)
+    html = html & TableHeaderCell("PAYMENT TERMS DESCRIPTION", 165)
+
+    html = html & "</tr>"
+
+    '-----------------------------------------------------
+    ' Filas
+    '-----------------------------------------------------
+
+    totalBalance = 0
+
+    For i = LBound(sortedRows) To UBound(sortedRows)
+
+        rowData = sortedRows(i)
+
+        html = html & "<tr>"
+
+        html = html & TableBodyCell(HtmlEncode(CStr(rowData(2))), 100, "left")
+        html = html & TableBodyCell(HtmlEncode(CStr(rowData(3))), 115, "left")
+        html = html & TableBodyCell(HtmlEncode(CStr(rowData(4))), 65, "left")
+        html = html & TableBodyCell(FormatDateCell(rowData(5)), 65, "center")
+        html = html & TableBodyCell(FormatDateCell(rowData(6)), 65, "center")
+        html = html & TableBodyCell(FormatDateCell(rowData(7)), 80, "center")
+        html = html & TableBodyCell(FormatAmountCell(rowData(8)), 105, "right")
+        html = html & TableBodyCell(HtmlEncode(CStr(rowData(9))), 165, "left")
+
+        html = html & "</tr>"
+
+        totalBalance = totalBalance + GetNumericValue(rowData(8))
+
+    Next i
+
+    '-----------------------------------------------------
+    ' Total
+    '-----------------------------------------------------
+
+    html = html & "<tr style='font-weight:bold;background-color:#F2F2F2;'>"
+
+    html = html & "<td colspan='6' style='" & _
+                  "border:1px solid #808080;" & _
+                  "padding:1px 2px;" & _
+                  "text-align:right;" & _
+                  "font-size:9pt;'>TOTAL</td>"
+
+    html = html & "<td style='" & _
+                  "border:1px solid #808080;" & _
+                  "padding:1px 2px;" & _
+                  "text-align:right;" & _
+                  "font-size:9pt;'>" & _
+                  Format$(totalBalance, "#,##0.00") & "</td>"
+
+    html = html & "<td style='border:1px solid #808080;" & _
+                  "padding:1px 2px;'></td>"
+
+    html = html & "</tr>"
+
+    html = html & "</table>"
+
+    BuildTableHTML = html
+
+End Function
+
+'=========================================================
+' CELDA DE ENCABEZADO
+'=========================================================
+
+Private Function TableHeaderCell( _
+    ByVal textValue As String, _
+    ByVal cellWidth As Long) As String
+
+    TableHeaderCell = _
+        "<th style='" & _
+        "border:1px solid #808080;" & _
+        "padding:1px 2px;" & _
+        "width:" & cellWidth & "px;" & _
+        "font-size:9pt;" & _
+        "font-weight:bold;" & _
+        "text-align:center;" & _
+        "vertical-align:middle;'>" & _
+        HtmlEncode(textValue) & "</th>"
+
+End Function
+
+'=========================================================
+' CELDA DE CONTENIDO
+'=========================================================
+
+Private Function TableBodyCell( _
+    ByVal textValue As String, _
+    ByVal cellWidth As Long, _
+    ByVal alignment As String) As String
+
+    TableBodyCell = _
+        "<td style='" & _
+        "border:1px solid #808080;" & _
+        "padding:1px 2px;" & _
+        "width:" & cellWidth & "px;" & _
+        "font-size:9pt;" & _
+        "text-align:" & alignment & ";" & _
+        "vertical-align:middle;" & _
+        "overflow-wrap:break-word;'>" & _
+        textValue & "</td>"
+
+End Function
+
+'=========================================================
+' ORDENAR FILAS POR DUE DATE ASCENDENTE
+'=========================================================
+
+Private Function SortRowsByDueDate( _
+    ByVal sourceRows As Collection) As Variant
+
+    Dim arr() As Variant
+    Dim temp As Variant
+
+    Dim i As Long
+    Dim j As Long
+    Dim countRows As Long
+
+    countRows = sourceRows.Count
+
+    If countRows = 0 Then
+        SortRowsByDueDate = Array()
+        Exit Function
+    End If
+
+    ReDim arr(0 To countRows - 1)
+
+    For i = 1 To countRows
+        arr(i - 1) = sourceRows(i)
+    Next i
+
+    For i = LBound(arr) To UBound(arr) - 1
+
+        For j = i + 1 To UBound(arr)
+
+            If GetDueDateKey(arr(j)(7)) < GetDueDateKey(arr(i)(7)) Then
+
+                temp = arr(i)
+                arr(i) = arr(j)
+                arr(j) = temp
+
+            End If
+
+        Next j
+
+    Next i
+
+    SortRowsByDueDate = arr
+
+End Function
+
+'=========================================================
+' OBTENER FECHA PARA ORDENAMIENTO
+'=========================================================
+
+Private Function GetDueDateKey(ByVal value As Variant) As Double
+
+    If IsDate(value) Then
+        GetDueDateKey = CDbl(CDate(value))
+    Else
+        GetDueDateKey = 2958465#
+    End If
+
+End Function
+
+'=========================================================
+' FORMATEAR FECHAS
+'=========================================================
+
+Private Function FormatDateCell(ByVal value As Variant) As String
+
+    If IsDate(value) Then
+        FormatDateCell = Format$(CDate(value), "dd/mm/yyyy")
+    Else
+        FormatDateCell = HtmlEncode(CStr(value))
+    End If
+
+End Function
+
+'=========================================================
+' FORMATEAR IMPORTES
+'=========================================================
+
+Private Function FormatAmountCell(ByVal value As Variant) As String
+
+    If IsNumeric(value) Then
+        FormatAmountCell = Format$(CDbl(value), "#,##0.00")
+    Else
+        FormatAmountCell = HtmlEncode(CStr(value))
+    End If
+
+End Function
+
+'=========================================================
+' CONVERTIR IMPORTE A NÚMERO
+'=========================================================
+
+Private Function GetNumericValue(ByVal value As Variant) As Double
+
+    If IsNumeric(value) Then
+        GetNumericValue = CDbl(value)
+    Else
+        GetNumericValue = 0
+    End If
+
+End Function
+
+'=========================================================
+' OBTENER COLOR DEL ENCABEZADO DESDE EXCEL
+'=========================================================
+
+Private Function GetHeaderColor( _
+    ByVal sheetName As String, _
+    ByVal fallbackColor As Long) As String
+
+    Dim ws As Worksheet
+    Dim colorValue As Long
+
+    On Error GoTo UseFallback
+
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+
+    colorValue = ws.Range("E3").DisplayFormat.Interior.Color
+
+    If colorValue = 0 Then
+        colorValue = ws.Range("E3").Interior.Color
+    End If
+
+    If colorValue = 0 Then
+        colorValue = fallbackColor
+    End If
+
+    GetHeaderColor = ExcelColorToHTML(colorValue)
+
+    Exit Function
+
+UseFallback:
+
+    GetHeaderColor = ExcelColorToHTML(fallbackColor)
+
+End Function
+
+'=========================================================
+' CONVERTIR COLOR EXCEL A HTML
+'=========================================================
+
+Private Function ExcelColorToHTML(ByVal colorValue As Long) As String
+
+    Dim redValue As Long
+    Dim greenValue As Long
+    Dim blueValue As Long
+
+    redValue = colorValue Mod 256
+    greenValue = (colorValue \ 256) Mod 256
+    blueValue = (colorValue \ 65536) Mod 256
+
+    ExcelColorToHTML = "#" & _
+        Right$("0" & Hex$(redValue), 2) & _
+        Right$("0" & Hex$(greenValue), 2) & _
+        Right$("0" & Hex$(blueValue), 2)
+
+End Function
+
+'=========================================================
+' CODIFICAR TEXTO HTML
+'=========================================================
+
+Private Function HtmlEncode(ByVal textValue As String) As String
+
+    textValue = Replace(textValue, "&", "&amp;")
+    textValue = Replace(textValue, "<", "&lt;")
+    textValue = Replace(textValue, ">", "&gt;")
+    textValue = Replace(textValue, """", "&quot;")
+    textValue = Replace(textValue, "'", "&#39;")
+
+    HtmlEncode = textValue
+
+End Function
+
+'=========================================================
+' ACTUALIZAR ESTADO EN COLUMNA U
+'=========================================================
+
+Private Sub UpdateCustomerStatus( _
+    ByVal customerData As Object, _
+    ByVal statusText As String, _
+    ByVal wsOverdue As Worksheet, _
+    ByVal wsUpcoming As Worksheet)
+
+    Dim allRows As Collection
+    Dim rowReference As Variant
+    Dim ws As Worksheet
+    Dim r As Long
+
+    Set allRows = customerData("AllRows")
+
+    For Each rowReference In allRows
+
+        If CStr(rowReference(0)) = SHEET_OVERDUE Then
+            Set ws = wsOverdue
+        Else
+            Set ws = wsUpcoming
+        End If
+
+        r = CLng(rowReference(1))
+
+        ws.Cells(r, COL_PROCESS_STATUS).Value = statusText
+
+    Next rowReference
+
+End Sub
